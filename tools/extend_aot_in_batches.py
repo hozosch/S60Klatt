@@ -52,7 +52,7 @@ def main() -> None:
 
     existing = {
         int(value, 16)
-        for value in re.findall(r"(?m)^L_([0-9a-f]{8}):$", read_source(args.source))
+        for value in re.findall(r"(?m)^L_([0-9a-fA-F]{8}):", read_source(args.source))
     }
     original_count = len(instructions)
     instructions = [item for item in instructions if int(item["address"]) not in existing]
