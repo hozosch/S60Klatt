@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pypcode
 
-from extend_prime_aot import cname, emit, read_rom
+from extend_prime_aot import cname, emit_instruction, read_rom, require_float_helpers
 from split_frontend_aot import route
 
 
@@ -145,21 +145,14 @@ def extend(source_path: Path, trace_path: Path, rom_path: Path,
                 f"L_{address:08x}:",
                 f"    nokia_frontend_last_pc=0x{address:08x}u;",
             ])
-            controlled = False
-            for operation in operations:
-                new_blocks.extend(
-                    route("    " + statement, local)
-                    for statement in emit(
-                        operation,
-                        local,
-                        address,
-                        int(item["size"]),
-                        thumb,
-                    )
-                )
-                controlled |= operation.opcode.name in (
-                    "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
-                )
+            size = int(item["size"])
+            new_blocks.extend(route("    " + statement, local)
+                              for statement in emit_instruction(
+                                  operations, local, address, size, thumb,
+                                  rom[address - rom_base:address - rom_base + size]))
+            controlled = any(operation.opcode.name in (
+                "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
+            ) for operation in operations)
             if not controlled:
                 following = address + int(item["size"])
                 if following in local:
@@ -170,6 +163,7 @@ def extend(source_path: Path, trace_path: Path, rom_path: Path,
                         "return NOKIA_FRONTEND_CONTINUE;"
                     )
 
+        require_float_helpers(source, new_blocks)
         marker = "    default: return NOKIA_FRONTEND_YIELDED;"
         if marker not in chunk_source:
             raise ValueError(f"chunk {index} dispatch marker was not found")

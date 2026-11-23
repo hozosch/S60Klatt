@@ -19,7 +19,21 @@ from pathlib import Path
 import pypcode
 
 
+def vfp_single_register(varnode) -> tuple[int, int] | None:
+    """S0..S31 are the two 32-bit halves of D0..D15 on ARM VFP."""
+    if varnode.space.name != "register" or varnode.size != 4:
+        return None
+    match = re.fullmatch(r"s([0-9]|[12][0-9]|3[01])", str(varnode).lower())
+    if not match:
+        return None
+    number = int(match.group(1))
+    return number // 2, (number % 2) * 32
+
+
 def cname(varnode) -> str:
+    single = vfp_single_register(varnode)
+    if single is not None:
+        return f"reg_d{single[0]}"
     if varnode.space.name in ("const", "ram"):
         return f"UINT64_C({varnode.offset})"
     if varnode.space.name == "register":
@@ -34,6 +48,9 @@ def mask(size: int) -> str:
 
 
 def value(varnode) -> str:
+    single = vfp_single_register(varnode)
+    if single is not None:
+        return f"((reg_d{single[0]} >> {single[1]}) & UINT64_C(0xffffffff))"
     if varnode.space.name == "ram":
         return (f"(nokia_mem_load(&machine, UINT64_C({varnode.offset}), "
                 f"{varnode.size}) & {mask(varnode.size)})")
@@ -45,6 +62,13 @@ def signed(varnode) -> str:
 
 
 def assign(output, expression: str) -> str:
+    single = vfp_single_register(output)
+    if single is not None:
+        name = f"reg_d{single[0]}"
+        shift = single[1]
+        keep = "0xffffffff00000000" if shift == 0 else "0x00000000ffffffff"
+        return (f"{name} = ({name} & UINT64_C({keep})) | "
+                f"((((uint64_t)({expression})) & UINT64_C(0xffffffff)) << {shift});")
     return f"{cname(output)} = ((uint64_t)({expression})) & {mask(output.size)};"
 
 
@@ -109,12 +133,34 @@ def emit(op, known: set[int], address: int, size: int, thumb: bool) -> list[str]
         "FLOAT_DIV": "nokia_float_div",
     }
     if name in float_binary:
+        if inputs[0].size not in (4, 8) or inputs[1].size != inputs[0].size or output.size != inputs[0].size:
+            raise ValueError(f"unsupported {name} width at {address:#x}")
         return [assign(
             output,
             f"{float_binary[name]}({value(inputs[0])}, {value(inputs[1])}, {inputs[0].size})",
         )]
     if name == "FLOAT_NEG":
+        if inputs[0].size not in (4, 8) or output.size != inputs[0].size:
+            raise ValueError(f"unsupported {name} width at {address:#x}")
         return [assign(output, f"nokia_float_neg({value(inputs[0])}, {inputs[0].size})")]
+    if name == "FLOAT_ABS":
+        if inputs[0].size not in (4, 8) or output.size != inputs[0].size:
+            raise ValueError(f"unsupported {name} width at {address:#x}")
+        return [assign(output, f"nokia_float_abs({value(inputs[0])}, {inputs[0].size})")]
+    if name == "FLOAT_NAN":
+        if inputs[0].size not in (4, 8) or output.size != 1:
+            raise ValueError(f"unsupported {name} width at {address:#x}")
+        return [assign(output, f"nokia_float_nan({value(inputs[0])}, {inputs[0].size})")]
+    comparisons = {"FLOAT_EQUAL": 0, "FLOAT_LESS": 1, "FLOAT_LESSEQUAL": 2}
+    if name in comparisons:
+        if inputs[0].size not in (4, 8) or inputs[1].size != inputs[0].size or output.size != 1:
+            raise ValueError(f"unsupported {name} width at {address:#x}")
+        return [assign(output, f"nokia_float_compare({value(inputs[0])}, {value(inputs[1])}, "
+                               f"{inputs[0].size}, {comparisons[name]})")]
+    if name == "FLOAT_FLOAT2FLOAT":
+        if (inputs[0].size, output.size) not in ((4, 8), (8, 4)):
+            raise ValueError(f"unsupported {name} width at {address:#x}")
+        return [assign(output, f"nokia_float_convert({value(inputs[0])}, {inputs[0].size}, {output.size})")]
     if name == "INT_CARRY":
         return [assign(output, f"nokia_carry({value(inputs[0])}, {value(inputs[1])}, {inputs[0].size})")]
     if name == "INT_SCARRY":
@@ -144,6 +190,70 @@ def emit(op, known: set[int], address: int, size: int, thumb: bool) -> list[str]
     if name in ("BRANCHIND", "CALLIND", "RETURN"):
         return [f"reg_pc={value(inputs[0])};", "goto dispatch;"]
     raise ValueError(f"unsupported P-code operation {name} at {address:#x}")
+
+
+def emit_instruction(operations, known: set[int], address: int, size: int,
+                     thumb: bool, instruction: bytes) -> list[str]:
+    """Translate one instruction, retaining ARM VFP comparison flags.
+
+    The current ARM SLEIGH translation leaves the carry flag clear for an
+    unordered VCMP and omits the invalid-operation cumulative flag.  Identify
+    its exact compare pattern and restore those flags from the original VFP
+    operands.  This remains a narrow instruction-level fix, not a generic
+    change to P-code floating-point comparison semantics.
+    """
+    statements = [statement for op in operations
+                  for statement in emit(op, known, address, size, thumb)]
+    ops = [op for op in operations if op.opcode.name != "IMARK"]
+    writes_fpscr = any(op.output is not None and str(op.output).lower() == "fpscr"
+                       for op in ops)
+    if not writes_fpscr or not any(op.opcode.name == "FLOAT_NAN" for op in ops):
+        return statements
+    expected = ("FLOAT_LESS", "FLOAT_EQUAL", "FLOAT_LESSEQUAL", "FLOAT_NAN", "FLOAT_NAN")
+    starts = [index for index, op in enumerate(ops) if op.opcode.name == "FLOAT_LESS"]
+    group = ops[starts[0]:starts[0] + len(expected)] if len(starts) == 1 else []
+    if (tuple(op.opcode.name for op in group) != expected or
+            not ops or str(ops[-1].output).lower() != "fpscr" or size != 4 or len(instruction) < 4):
+        raise ValueError(f"unrecognised ARM VFP comparison at {address:#x}")
+
+    def key(node):
+        return node.space.name, node.offset, node.size
+
+    left, right = group[0].inputs
+    if (tuple(map(key, group[1].inputs)) != (key(left), key(right)) or
+            tuple(map(key, group[2].inputs)) != (key(right), key(left)) or
+            key(group[3].inputs[0]) != key(left) or key(group[4].inputs[0]) != key(right)):
+        raise ValueError(f"unrecognised ARM VFP operands at {address:#x}")
+    if thumb:
+        word = (int.from_bytes(instruction[:2], "little") << 16) | int.from_bytes(instruction[2:4], "little")
+    else:
+        word = int.from_bytes(instruction[:4], "little")
+    # ARM and Thumb-2 share the VCMP/VCMPE bit layout after their halfwords
+    # are ordered as an instruction word. Register, size, E, and compare-zero
+    # fields are intentionally left unmasked.
+    mask = (0x1f << 23) | (3 << 20) | (7 << 17) | (7 << 9) | (1 << 6) | (1 << 4)
+    pattern = (0x1d << 23) | (3 << 20) | (2 << 17) | (5 << 9) | (1 << 6)
+    if word & mask != pattern:
+        raise ValueError(f"unrecognised ARM VFP comparison encoding at {address:#x}")
+    nan = f"({value(group[3].output)} | {value(group[4].output)})"
+    invalid = (f"(nokia_float_snan({value(left)}, {left.size}) | "
+               f"nokia_float_snan({value(right)}, {right.size}))")
+    # The exception-signalling VCMPE encoding has bit 7 set in the low
+    # halfword; Thumb stores that halfword after the high halfword.
+    if word & 0x80:
+        invalid = f"({invalid} | {nan})"
+    flags = ops[-1].output
+    statements.append(assign(flags, f"{value(flags)} | ({nan} << 29) | {invalid}"))
+    return statements
+
+
+def require_float_helpers(source: str, statements) -> None:
+    """Do not emit C that calls floating-point helpers absent from its seed."""
+    names = set(re.findall(r"\bnokia_float_[a-z0-9_]+(?=\()", "\n".join(statements)))
+    missing = sorted(name for name in names if not re.search(
+        rf"\buint64_t\s+{re.escape(name)}\s*\([^;{{}}]*\)\s*\{{", source))
+    if missing:
+        raise ValueError("frontend seed lacks floating-point helpers: " + ", ".join(missing))
 
 
 def read_text(path: Path) -> str:
@@ -311,17 +421,16 @@ def extend(source_path: Path, trace_path: Path, rom_path: Path,
         size, thumb, operations = lifted[address]
         labels.append(f"L_{address:08x}:")
         labels.append(f"    nokia_frontend_last_pc=0x{address:08x}u;")
-        controlled = False
-        for operation in operations:
-            labels.extend("    " + statement
-                          for statement in emit(operation, known, address,
-                                                size, thumb))
-            controlled |= operation.opcode.name in (
-                "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
-            )
+        instruction = rom[address - rom_base:address - rom_base + size]
+        labels.extend("    " + statement for statement in emit_instruction(
+            operations, known, address, size, thumb, instruction))
+        controlled = any(operation.opcode.name in (
+            "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
+        ) for operation in operations)
         if not controlled:
             following = address + size
             labels.append(branch_to(following, known, "    "))
+    require_float_helpers(source, labels)
     insert_at = source.index("finished:")
     source = source[:insert_at] + "\n".join(labels) + "\n" + source[insert_at:]
 
