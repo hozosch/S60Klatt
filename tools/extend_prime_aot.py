@@ -10,6 +10,7 @@ into resumable yields to the still-emulated DSP.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import gzip
 import json
 import re
@@ -17,6 +18,78 @@ import struct
 from pathlib import Path
 
 import pypcode
+
+
+LABEL = re.compile(r"(?m)^L_([0-9a-fA-F]{8}):")
+
+
+def frontend_labels(source: str) -> set[int]:
+    """Include inline host-hook labels as well as generated instruction labels."""
+    return {int(match.group(1), 16) for match in LABEL.finditer(source)}
+
+
+def normalize_frontend_hooks(source: str) -> str:
+    """Resolve known legacy host-hook collisions without changing their behavior.
+
+    The original corpus defines these executive calls as host hooks.  An older
+    extender also emitted traced instruction blocks for two of them, creating
+    duplicate C cases and labels.  Keep the hook for both dispatch and direct
+    jumps, matching the split frontend's executive-call handling.  Reject
+    ambiguous layouts rather than guessing which implementation to keep.
+    """
+    for address, cell in ((0x8019DB50, 0x53000010),
+                          (0x8019DB70, 0x53000014),
+                          (0x8019DB88, 0x53000018)):
+        name = f"{address:08x}"
+        action = (f"reg_r0=nokia_mem_load(&machine,0x{cell:08x}u,4);"
+                  "reg_pc=reg_lr;goto dispatch;")
+        inline = f"L_{name}: {action}\n"
+        direct_case = f"    case 0x{name}u: {action}\n"
+        lifted_case = f"    case 0x{name}u: goto L_{name};\n"
+        dispatch_at = source.index("dispatch:\n")
+        markers = [source.find(marker, dispatch_at) for marker in (
+            "    default: goto yielded;", "    default: goto unsupported;")]
+        dispatch_end = min(pos for pos in markers if pos >= 0)
+        dispatch = source[dispatch_at:dispatch_end]
+        cases = re.findall(rf"(?m)^\s*case\s+0x{name}u:[^\n]*(?:\n|$)", dispatch)
+        if len(cases) > 1:
+            if (len(cases) != 2 or dispatch.count(direct_case) != 1 or
+                    dispatch.count(lifted_case) != 1 or source.count(inline) != 1):
+                raise ValueError(f"ambiguous executive dispatch at 0x{name}")
+            source = source.replace(lifted_case, "", 1)
+        labels = list(re.finditer(rf"(?m)^L_{name}:[^\n]*(?:\n|$)", source))
+        if len(labels) > 1:
+            if len(labels) != 2 or source.count(inline) != 1:
+                raise ValueError(f"ambiguous executive labels at 0x{name}")
+            lifted = [match for match in labels if match.group(0) == f"L_{name}:\n"]
+            if len(lifted) != 1:
+                raise ValueError(f"unexpected executive label at 0x{name}")
+            start = lifted[0].start()
+            following = re.search(r"(?m)^(?:L_[0-9a-fA-F]{8}:|finished:)", source[lifted[0].end():])
+            if following is None:
+                raise ValueError(f"unterminated executive block at 0x{name}")
+            end = lifted[0].end() + following.start()
+            body = source[lifted[0].end():end]
+            previous = source[:start].rstrip().rsplit("\n", 1)[-1].strip()
+            if (not body.startswith(f"    nokia_frontend_last_pc=0x{name}u;\n") or
+                    not re.search(r"\b(?:goto\s+[A-Za-z_]\w*|return(?:\s+[^;]+)?);$", previous)):
+                raise ValueError(f"cannot safely remove executive block at 0x{name}")
+            source = source[:start] + source[end:]
+
+    labels = Counter(int(match.group(1), 16) for match in LABEL.finditer(source))
+    duplicates = sorted(address for address, count in labels.items() if count > 1)
+    if duplicates:
+        raise ValueError("duplicate frontend labels: " + ", ".join(f"0x{x:08x}" for x in duplicates))
+    dispatch_at = source.index("dispatch:\n")
+    markers = [source.find(marker, dispatch_at) for marker in (
+        "    default: goto yielded;", "    default: goto unsupported;")]
+    dispatch_end = min(pos for pos in markers if pos >= 0)
+    cases = Counter(int(value, 16) for value in re.findall(
+        r"(?m)^\s*case\s+0x([0-9a-fA-F]{8})u\s*:", source[dispatch_at:dispatch_end]))
+    duplicates = sorted(address for address, count in cases.items() if count > 1)
+    if duplicates:
+        raise ValueError("duplicate frontend dispatch cases: " + ", ".join(f"0x{x:08x}" for x in duplicates))
+    return source
 
 
 def cname(varnode) -> str:
@@ -194,7 +267,7 @@ def collect_function(rom: bytes, rom_base: int, entry: int,
 
 def extend(source_path: Path, trace_path: Path, rom_path: Path,
            output_path: Path, repair_fallthroughs: bool = False) -> None:
-    source = read_text(source_path)
+    source = normalize_frontend_hooks(read_text(source_path))
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     rom, rom_base = read_rom(rom_path)
     # This EUser type helper is normally hidden behind a Unicorn-side system
@@ -208,8 +281,7 @@ def extend(source_path: Path, trace_path: Path, rom_path: Path,
         for address in collect_function(rom, rom_base, entry, thumb):
             static_modes[address] = thumb
     static_helpers = set(static_modes)
-    existing = {int(value, 16) for value in
-                re.findall(r"(?m)^L_([0-9a-f]{8}):$", source)}
+    existing = frontend_labels(source)
     traced = {item["address"]: item for item in trace["instructions"]}
     for address in static_helpers:
         if address not in traced:
@@ -316,7 +388,7 @@ def extend(source_path: Path, trace_path: Path, rom_path: Path,
     for match in terminal.finditer(source) if repair_fallthroughs else ():
         address = int(match.group(1), 16)
         item = traced.get(address)
-        if item is None or address + item["size"] not in lifted:
+        if item is None or address + item["size"] not in known:
             continue
         context = pypcode.Context(
             "ARM:LE:32:v8T" if item["thumb"] else "ARM:LE:32:v8")
@@ -356,7 +428,7 @@ def extend(source_path: Path, trace_path: Path, rom_path: Path,
             if len(branches) != 1:
                 continue
             target = direct_target(branches[0].inputs[0])
-            if target not in lifted:
+            if target not in known:
                 continue
             conditional = re.search(
                 r"(?m)^(    if \(.*\)) goto unsupported;$", match.group(0))
