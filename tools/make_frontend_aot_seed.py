@@ -47,6 +47,28 @@ static uint64_t nokia_float_div(uint64_t a,uint64_t b,unsigned s){
     if(s==8){double x,y,z;uint64_t w;memcpy(&x,&a,8);memcpy(&y,&b,8);z=x/y;memcpy(&w,&z,8);return w;}return 0;}
 static uint64_t nokia_float_neg(uint64_t a,unsigned s){
     return s==4?(a^UINT64_C(0x80000000)):(s==8?(a^UINT64_C(0x8000000000000000)):a);}
+static uint64_t nokia_float_abs(uint64_t a,unsigned s){
+    return s==4?(a&UINT64_C(0x7fffffff)):(a&UINT64_C(0x7fffffffffffffff));}
+static uint64_t nokia_float_nan(uint64_t a,unsigned s){
+    if(s==4)return (a&UINT64_C(0x7f800000))==UINT64_C(0x7f800000) && (a&UINT64_C(0x007fffff))!=0;
+    return (a&UINT64_C(0x7ff0000000000000))==UINT64_C(0x7ff0000000000000) && (a&UINT64_C(0x000fffffffffffff))!=0;}
+static uint64_t nokia_float_snan(uint64_t a,unsigned s){
+    return nokia_float_nan(a,s) && !(a&(s==4?UINT64_C(0x00400000):UINT64_C(0x0008000000000000)));}
+static uint64_t nokia_float_compare(uint64_t a,uint64_t b,unsigned s,unsigned op){
+    uint64_t sign=s==4?UINT64_C(0x80000000):UINT64_C(0x8000000000000000);
+    uint64_t all=s==4?UINT64_C(0xffffffff):UINT64_MAX;
+    a&=all;b&=all;
+    if(nokia_float_nan(a,s)||nokia_float_nan(b,s))return 0;
+    if(!(a&~sign)&&!(b&~sign))return op!=1;
+    if(op==0)return a==b;
+    a=(a&sign)?(~a&all):(a|sign);b=(b&sign)?(~b&all):(b|sign);
+    return op==1?a<b:a<=b;}
+static uint64_t nokia_float_convert(uint64_t a,unsigned from,unsigned to){
+    if(from==4 && to==8){uint32_t u=(uint32_t)a;float x;double y;uint64_t out;
+        memcpy(&x,&u,4);y=(double)x;memcpy(&out,&y,8);return out;}
+    if(from==8 && to==4){double x;float y;uint32_t out;
+        memcpy(&x,&a,8);y=(float)x;memcpy(&out,&y,4);return out;}
+    return a;}
 '''
     if marker not in source:
         raise ValueError("generated frontend memory helper marker was not found")

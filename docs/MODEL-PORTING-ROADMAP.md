@@ -26,6 +26,36 @@ Guillem Leon's original
 Firmware-derived binaries remain third-party preservation material and are
 not relicensed by this project's GPL code.
 
+## N95 8GB floating-point preparation
+
+The native AOT tooling can now translate a limited set of ordinary ARM and
+Thumb VFP operations without using phone firmware as a test input. Single
+registers S0–S31 share storage with the corresponding halves of D0–D15;
+the generator supports floating-point comparisons, NaN detection, absolute
+value and single/double conversions as well as the existing arithmetic. It
+also corrects the unordered and invalid-operation flags for the recognized
+VCMP/VCMPE instruction pattern. The generator rejects that pattern if its
+encoding or translation is not recognized, and rejects floating-point calls
+when the supplied source seed does not contain the required helpers.
+
+`tests/test_arm_vfp_aot.py` uses independently authored instruction bytes and
+compiles generated C. With `pypcode` and a C compiler installed, run:
+
+```console
+python -m unittest tests.test_arm_vfp_aot
+```
+
+When Unicorn is installed, additional tests compare ARM and Thumb results
+with its ARM emulator. These tests use no Nokia firmware, snapshots or speech
+data. They verify only the listed instruction cases and default rounding.
+
+This does **not** make the N95 8GB runtime complete. The phone's actual
+instruction and AEABI helper paths have not been exercised by these tests.
+Floating-point state across native yields, FPSCR rounding and flush modes,
+and arithmetic/conversion exception flags still need implementation or
+validation before claiming faithful VFP behavior. Unsupported operations
+must remain explicit failures rather than silently producing a voice.
+
 ## Runtime layers to make reusable
 
 The native implementation should not hard-code the 5320 wherever the phone

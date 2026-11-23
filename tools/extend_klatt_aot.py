@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pypcode
 
-from extend_prime_aot import cname, direct_target, emit, read_rom
+from extend_prime_aot import (cname, direct_target, emit, emit_instruction,
+                              read_rom, require_float_helpers)
 
 
 def extend(
@@ -92,15 +93,12 @@ def extend(
     for address in sorted(lifted):
         size, thumb, operations = lifted[address]
         blocks.extend((f"L_{address:08x}:", f"    nokia_at=0x{address:08x}u;"))
-        controlled = False
-        for operation in operations:
-            blocks.extend(
-                "    " + statement
-                for statement in emit(operation, known, address, size, thumb)
-            )
-            controlled |= operation.opcode.name in (
-                "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
-            )
+        blocks.extend("    " + statement for statement in emit_instruction(
+            operations, known, address, size, thumb,
+            rom[address - rom_base:address - rom_base + size]))
+        controlled = any(operation.opcode.name in (
+            "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
+        ) for operation in operations)
         if not controlled:
             following = address + size
             if following in known:
@@ -110,6 +108,7 @@ def extend(
                     f"    reg_pc=UINT64_C({following});",
                     "    goto dispatch;",
                 ))
+    require_float_helpers(source, blocks)
     insert_at = source.index("finished:")
     source = source[:insert_at] + "\n".join(blocks) + "\n" + source[insert_at:]
 

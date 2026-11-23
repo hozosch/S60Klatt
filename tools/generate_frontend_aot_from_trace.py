@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pypcode
 
-from extend_prime_aot import branch_to, cname, emit, read_rom, read_text
+from extend_prime_aot import (branch_to, cname, emit_instruction, read_rom,
+                              read_text, require_float_helpers)
 
 
 _rom = b""
@@ -43,7 +44,6 @@ def _translate(item: dict) -> tuple[int, str, str, tuple[str, ...]]:
         f"L_{address:08x}:",
         f"    nokia_frontend_last_pc=0x{address:08x}u;",
     ]
-    controlled = False
     for operation in operations:
         nodes = (
             ([operation.output] if operation.output is not None else [])
@@ -52,13 +52,12 @@ def _translate(item: dict) -> tuple[int, str, str, tuple[str, ...]]:
         for node in nodes:
             if node.space.name in ("register", "unique"):
                 variables.add(cname(node))
-        lines.extend(
-            "    " + statement
-            for statement in emit(operation, _known, address, size, thumb)
-        )
-        controlled |= operation.opcode.name in (
-            "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
-        )
+    lines.extend("    " + statement for statement in emit_instruction(
+        operations, _known, address, size, thumb,
+        _rom[address - _rom_base:address - _rom_base + size]))
+    controlled = any(operation.opcode.name in (
+        "BRANCH", "CALL", "BRANCHIND", "CALLIND", "RETURN"
+    ) for operation in operations)
     if not controlled:
         lines.append(branch_to(address + size, _known, "    "))
     return (
@@ -109,6 +108,7 @@ def main() -> None:
     ) as pool:
         translated = pool.map(_translate, items, chunksize=32)
 
+    require_float_helpers(source, (block for _, _, block, _ in translated))
     variables = {name for _, _, _, names in translated for name in names}
     declared = set(re.findall(
         r"(?m)^    uint64_t ([A-Za-z0-9_]+)=0;$", source
